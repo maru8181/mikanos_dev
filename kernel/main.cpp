@@ -8,10 +8,10 @@
 #include <cstddef>
 #include <cstdio>
 
-#include <numeric>
-#include <vector>
 #include <deque>
 #include <limits>
+#include <numeric>
+#include <vector>
 
 #include "frame_buffer_config.hpp"
 #include "memory_map.hpp"
@@ -33,6 +33,7 @@
 #include "timer.hpp"
 #include "acpi.hpp"
 #include "keyboard.hpp"
+#include "task.hpp"
 
 int printk(const char* format, ...) {
   va_list ap;
@@ -85,15 +86,12 @@ void InitializeTextWindow() {
 
 int text_window_index;
 
-// #@@range_begin(draw_cursor)
 void DrawTextCursor(bool visible) {
   const auto color = visible ? ToColor(0) : ToColor(0xffffff);
   const auto pos = Vector2D<int>{8 + 8*text_window_index, 24 + 5};
   FillRectangle(*text_window->Writer(), pos, {7, 15}, color);
 }
-// #@@range_end(draw_cursor)
 
-// #@@range_begin(input_text)
 void InputTextWindow(char c) {
   if (c == 0) {
     return;
@@ -116,9 +114,35 @@ void InputTextWindow(char c) {
 
   layer_manager->Draw(text_window_layer_id);
 }
-// #@@range_end(input_text)
 
-std::deque<Message>* main_queue;
+std::shared_ptr<Window> task_b_window;
+unsigned int task_b_window_layer_id;
+void InitializeTaskBWindow() {
+  task_b_window = std::make_shared<Window>(
+      160, 52, screen_config.pixel_format);
+  DrawWindow(*task_b_window->Writer(), "TaskB Window");
+
+  task_b_window_layer_id = layer_manager->NewLayer()
+    .SetWindow(task_b_window)
+    .SetDraggable(true)
+    .Move({100, 100})
+    .ID();
+
+  layer_manager->UpDown(task_b_window_layer_id, std::numeric_limits<int>::max());
+}
+
+void TaskB(uint64_t task_id, int64_t data) {
+  printk("TaskB: task_id=%lu, data=%lu\n", task_id, data);
+  char str[128];
+  int count = 0;
+  while (true) {
+    ++count;
+    sprintf(str, "%010d", count);
+    FillRectangle(*task_b_window->Writer(), {24, 28}, {8 * 10, 16}, {0xc6, 0xc6, 0xc6});
+    WriteString(*task_b_window->Writer(), {24, 28}, str, {0, 0, 0});
+    layer_manager->Draw(task_b_window_layer_id);
+  }
+}
 
 alignas(16) uint8_t kernel_main_stack[1024 * 1024];
 
@@ -137,31 +161,36 @@ extern "C" void KernelMainNewStack(
   InitializeSegmentation();
   InitializePaging();
   InitializeMemoryManager(memory_map);
-  ::main_queue = new std::deque<Message>(32);
-  InitializeInterrupt(main_queue);
+  InitializeInterrupt();
 
   InitializePCI();
-  usb::xhci::Initialize();
 
   InitializeLayer();
   InitializeMainWindow();
   InitializeTextWindow();
-  InitializeMouse();
+  InitializeTaskBWindow();
   layer_manager->Draw({{0, 0}, ScreenSize()});
 
   acpi::Initialize(acpi_table);
-  InitializeLAPICTimer(*main_queue);
+  InitializeLAPICTimer();
 
-  InitializeKeyboard(*main_queue);
-
-  // #@@range_begin(add_timer)
   const int kTextboxCursorTimer = 1;
   const int kTimer05Sec = static_cast<int>(kTimerFreq * 0.5);
-  __asm__("cli");
   timer_manager->AddTimer(Timer{kTimer05Sec, kTextboxCursorTimer});
-  __asm__("sti");
   bool textbox_cursor_visible = false;
-  // #@@range_end(add_timer)
+
+  // #@@range_begin(init_tasks)
+  InitializeTask();
+  Task& main_task = task_manager->CurrentTask();
+  const uint64_t taskb_id = task_manager->NewTask()
+    .InitContext(TaskB, 45)
+    .Wakeup()
+    .ID();
+  // #@@range_end(init_tasks)
+
+  usb::xhci::Initialize();
+  InitializeKeyboard();
+  InitializeMouse();
 
   char str[128];
 
@@ -176,37 +205,40 @@ extern "C" void KernelMainNewStack(
     layer_manager->Draw(main_window_layer_id);
 
     __asm__("cli");
-    if (main_queue->size() == 0) {
-      __asm__("sti\n\thlt");
+    auto msg = main_task.ReceiveMessage();
+    if (!msg) {
+      main_task.Sleep();
+      __asm__("sti");
       continue;
     }
 
-    Message msg = main_queue->front();
-    main_queue->pop_front();
     __asm__("sti");
 
-    switch (msg.type) {
+    switch (msg->type) {
     case Message::kInterruptXHCI:
       usb::xhci::ProcessEvents();
       break;
-    // #@@range_begin(timer_event)
     case Message::kTimerTimeout:
-      if (msg.arg.timer.value == kTextboxCursorTimer) {
+      if (msg->arg.timer.value == kTextboxCursorTimer) {
         __asm__("cli");
         timer_manager->AddTimer(
-            Timer{msg.arg.timer.timeout + kTimer05Sec, kTextboxCursorTimer});
+            Timer{msg->arg.timer.timeout + kTimer05Sec, kTextboxCursorTimer});
         __asm__("sti");
         textbox_cursor_visible = !textbox_cursor_visible;
         DrawTextCursor(textbox_cursor_visible);
         layer_manager->Draw(text_window_layer_id);
       }
       break;
-    // #@@range_end(timer_event)
     case Message::kKeyPush:
-      InputTextWindow(msg.arg.keyboard.ascii);
+      InputTextWindow(msg->arg.keyboard.ascii);
+      if (msg->arg.keyboard.ascii == 's') {
+        printk("sleep TaskB: %s\n", task_manager->Sleep(taskb_id).Name());
+      } else if (msg->arg.keyboard.ascii == 'w') {
+        printk("wakeup TaskB: %s\n", task_manager->Wakeup(taskb_id).Name());
+      }
       break;
     default:
-      Log(kError, "Unknown message type: %d\n", msg.type);
+      Log(kError, "Unknown message type: %d\n", msg->type);
     }
   }
 }
