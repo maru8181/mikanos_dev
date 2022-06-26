@@ -1,20 +1,7 @@
-int strcmp(const char* a, const char* b) {
-  int i = 0;
-  for (; a[i] != 0 && b[i] != 0; ++i) {
-    if (a[i] != b[i]) {
-      return a[i] - b[i];
-    }
-  }
-  return a[i] - b[i];
-}
-
-long atol(const char* s) {
-  long v = 0;
-  for (int i = 0; s[i] != 0; ++i) {
-    v = v * 10 + (s[i] - '0');
-  }
-  return v;
-}
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include "../syscall.h"
 
 int stack_ptr;
 long stack[100];
@@ -30,7 +17,7 @@ void Push(long value) {
   stack[stack_ptr] = value;
 }
 
-extern "C" int main(int argc, char** argv) {
+extern "C" void main(int argc, char** argv) {
   stack_ptr = -1;
 
   for (int i = 1; i < argc; ++i) {
@@ -47,8 +34,11 @@ extern "C" int main(int argc, char** argv) {
       Push(a);
     }
   }
-  if (stack_ptr < 0) {
-    return 0;
+  long result = 0;
+  if (stack_ptr >= 0) {
+    result = Pop();
   }
-  return static_cast<int>(Pop());
+
+  printf("%ld\n", result);
+  exit(static_cast<int>(result));
 }

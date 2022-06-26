@@ -1,5 +1,6 @@
 #include "memory_manager.hpp"
 
+#include <bitset>
 #include "logger.hpp"
 
 BitmapMemoryManager::BitmapMemoryManager()
@@ -50,6 +51,15 @@ void BitmapMemoryManager::SetMemoryRange(FrameID range_begin, FrameID range_end)
   range_end_ = range_end;
 }
 
+MemoryStat BitmapMemoryManager::Stat() const {
+  size_t sum = 0;
+  for (int i = range_begin_.ID() / kBitsPerMapLine;
+       i < range_end_.ID() / kBitsPerMapLine; ++i) {
+    sum += std::bitset<kBitsPerMapLine>(alloc_map_[i]).count();
+  }
+  return { sum, range_end_.ID() - range_begin_.ID() };
+}
+
 bool BitmapMemoryManager::GetBit(FrameID frame) const {
   auto line_index = frame.ID() / kBitsPerMapLine;
   auto bit_index = frame.ID() % kBitsPerMapLine;
@@ -72,7 +82,6 @@ extern "C" caddr_t program_break, program_break_end;
 
 namespace {
   char memory_manager_buf[sizeof(BitmapMemoryManager)];
-  BitmapMemoryManager* memory_manager;
 
   Error InitializeHeap(BitmapMemoryManager& memory_manager) {
     const int kHeapFrames = 64 * 512;
@@ -86,6 +95,8 @@ namespace {
     return MAKE_ERROR(Error::kSuccess);
   }
 }
+
+BitmapMemoryManager* memory_manager;
 
 void InitializeMemoryManager(const MemoryMap& memory_map) {
   ::memory_manager = new(memory_manager_buf) BitmapMemoryManager;

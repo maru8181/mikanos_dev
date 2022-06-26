@@ -3,6 +3,15 @@
 #include <algorithm>
 #include "console.hpp"
 #include "logger.hpp"
+#include "task.hpp"
+
+namespace {
+  template <class T, class U>
+  void EraseIf(T& c, const U& pred) {
+    auto it = std::remove_if(c.begin(), c.end(), pred);
+    c.erase(it, c.end());
+  }
+} // namespace
 
 Layer::Layer(unsigned int id) : id_{id} {
 }
@@ -61,6 +70,15 @@ void LayerManager::SetWriter(FrameBuffer* screen) {
 Layer& LayerManager::NewLayer() {
   ++latest_id_;
   return *layers_.emplace_back(new Layer{latest_id_});
+}
+
+void LayerManager::RemoveLayer(unsigned int id) {
+  Hide(id);
+
+  auto pred = [id](const std::unique_ptr<Layer>& elem) {
+    return elem->ID() == id;
+  };
+  EraseIf(layers_, pred);
 }
 
 void LayerManager::Draw(const Rectangle<int>& area) const {
@@ -188,6 +206,17 @@ int LayerManager::GetHeight(unsigned int id) {
 
 namespace {
   FrameBuffer* screen;
+
+  Error SendWindowActiveMessage(unsigned int layer_id, int activate) {
+    auto task_it = layer_task_map->find(layer_id);
+    if (task_it == layer_task_map->end()) {
+      return MAKE_ERROR(Error::kNoSuchTask);
+    }
+
+    Message msg{Message::kWindowActive};
+    msg.arg.window_active.activate = activate;
+    return task_manager->SendMessage(task_it->second, msg);
+  }
 }
 
 LayerManager* layer_manager;
@@ -208,14 +237,17 @@ void ActiveLayer::Activate(unsigned int layer_id) {
     Layer* layer = manager_.FindLayer(active_layer_);
     layer->GetWindow()->Deactivate();
     manager_.Draw(active_layer_);
+    SendWindowActiveMessage(active_layer_, 0);
   }
 
   active_layer_ = layer_id;
   if (active_layer_ > 0) {
     Layer* layer = manager_.FindLayer(active_layer_);
     layer->GetWindow()->Activate();
+    manager_.UpDown(active_layer_, 0);
     manager_.UpDown(active_layer_, manager_.GetHeight(mouse_layer_) - 1);
     manager_.Draw(active_layer_);
+    SendWindowActiveMessage(active_layer_, 1);
   }
 }
 
@@ -276,4 +308,23 @@ void ProcessLayerMessage(const Message& msg) {
     layer_manager->Draw(arg.layer_id, {{arg.x, arg.y}, {arg.w, arg.h}});
     break;
   }
+}
+
+Error CloseLayer(unsigned int layer_id) {
+  Layer* layer = layer_manager->FindLayer(layer_id);
+  if (layer == nullptr) {
+    return MAKE_ERROR(Error::kNoSuchEntry);
+  }
+
+  const auto pos = layer->GetPosition();
+  const auto size = layer->GetWindow()->Size();
+
+  __asm__("cli");
+  active_layer->Activate(0);
+  layer_manager->RemoveLayer(layer_id);
+  layer_manager->Draw({pos, size});
+  layer_task_map->erase(layer_id);
+  __asm__("sti");
+
+  return MAKE_ERROR(Error::kSuccess);
 }
