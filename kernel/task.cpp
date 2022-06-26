@@ -45,6 +45,10 @@ TaskContext& Task::Context() {
   return context_;
 }
 
+uint64_t& Task::OSStackPointer() {
+  return os_stack_ptr_;
+}
+
 uint64_t Task::ID() const {
   return id_;
 }
@@ -74,6 +78,38 @@ std::optional<Message> Task::ReceiveMessage() {
   return m;
 }
 
+std::vector<std::shared_ptr<::FileDescriptor>>& Task::Files() {
+  return files_;
+}
+
+uint64_t Task::DPagingBegin() const {
+  return dpaging_begin_;
+}
+
+void Task::SetDPagingBegin(uint64_t v) {
+  dpaging_begin_ = v;
+}
+
+uint64_t Task::DPagingEnd() const {
+  return dpaging_end_;
+}
+
+void Task::SetDPagingEnd(uint64_t v) {
+  dpaging_end_ = v;
+}
+
+uint64_t Task::FileMapEnd() const {
+  return file_map_end_;
+}
+
+void Task::SetFileMapEnd(uint64_t v) {
+  file_map_end_ = v;
+}
+
+std::vector<FileMapping>& Task::FileMaps() {
+  return file_maps_;
+}
+
 TaskManager::TaskManager() {
   Task& task = NewTask()
     .SetLevel(current_level_)
@@ -92,30 +128,13 @@ Task& TaskManager::NewTask() {
   return *tasks_.emplace_back(new Task{latest_id_});
 }
 
-void TaskManager::SwitchTask(bool current_sleep) {
-  auto& level_queue = running_[current_level_];
-  Task* current_task = level_queue.front();
-  level_queue.pop_front();
-  if (!current_sleep) {
-    level_queue.push_back(current_task);
+void TaskManager::SwitchTask(const TaskContext& current_ctx) {
+  TaskContext& task_ctx = task_manager->CurrentTask().Context();
+  memcpy(&task_ctx, &current_ctx, sizeof(TaskContext));
+  Task* current_task = RotateCurrentRunQueue(false);
+  if (&CurrentTask() != current_task) {
+    RestoreContext(&CurrentTask().Context());
   }
-  if (level_queue.empty()) {
-    level_changed_ = true;
-  }
-
-  if (level_changed_) {
-    level_changed_ = false;
-    for (int lv = kMaxLevel; lv >= 0; --lv) {
-      if (!running_[lv].empty()) {
-        current_level_ = lv;
-        break;
-      }
-    }
-  }
-
-  Task* next_task = running_[current_level_].front();
-
-  SwitchContext(&next_task->Context(), &current_task->Context());
 }
 
 void TaskManager::Sleep(Task* task) {
@@ -126,7 +145,8 @@ void TaskManager::Sleep(Task* task) {
   task->SetRunning(false);
 
   if (task == running_[current_level_].front()) {
-    SwitchTask(true);
+    Task* current_task = RotateCurrentRunQueue(true);
+    SwitchContext(&CurrentTask().Context(), &current_task->Context());
     return;
   }
 
@@ -190,6 +210,40 @@ Task& TaskManager::CurrentTask() {
   return *running_[current_level_].front();
 }
 
+void TaskManager::Finish(int exit_code) {
+  Task* current_task = RotateCurrentRunQueue(true);
+
+  const auto task_id = current_task->ID();
+  auto it = std::find_if(
+      tasks_.begin(), tasks_.end(),
+      [current_task](const auto& t){ return t.get() == current_task; });
+  tasks_.erase(it);
+
+  finish_tasks_[task_id] = exit_code;
+  if (auto it = finish_waiter_.find(task_id); it != finish_waiter_.end()) {
+    auto waiter = it->second;
+    finish_waiter_.erase(it);
+    Wakeup(waiter);
+  }
+
+  RestoreContext(&CurrentTask().Context());
+}
+
+WithError<int> TaskManager::WaitFinish(uint64_t task_id) {
+  int exit_code;
+  Task* current_task = &CurrentTask();
+  while (true) {
+    if (auto it = finish_tasks_.find(task_id); it != finish_tasks_.end()) {
+      exit_code = it->second;
+      finish_tasks_.erase(it);
+      break;
+    }
+    finish_waiter_[task_id] = current_task;
+    Sleep(current_task);
+  }
+  return { exit_code, MAKE_ERROR(Error::kSuccess) };
+}
+
 void TaskManager::ChangeLevelRunning(Task* task, int level) {
   if (level < 0 || level == task->Level()) {
     return;
@@ -218,6 +272,30 @@ void TaskManager::ChangeLevelRunning(Task* task, int level) {
   }
 }
 
+Task* TaskManager::RotateCurrentRunQueue(bool current_sleep) {
+  auto& level_queue = running_[current_level_];
+  Task* current_task = level_queue.front();
+  level_queue.pop_front();
+  if (!current_sleep) {
+    level_queue.push_back(current_task);
+  }
+  if (level_queue.empty()) {
+    level_changed_ = true;
+  }
+
+  if (level_changed_) {
+    level_changed_ = false;
+    for (int lv = kMaxLevel; lv >= 0; --lv) {
+      if (!running_[lv].empty()) {
+        current_level_ = lv;
+        break;
+      }
+    }
+  }
+
+  return current_task;
+}
+
 TaskManager* task_manager;
 
 void InitializeTask() {
@@ -225,6 +303,11 @@ void InitializeTask() {
 
   __asm__("cli");
   timer_manager->AddTimer(
-      Timer{timer_manager->CurrentTick() + kTaskTimerPeriod, kTaskTimerValue});
+      Timer{timer_manager->CurrentTick() + kTaskTimerPeriod, kTaskTimerValue, 1});
   __asm__("sti");
+}
+
+__attribute__((no_caller_saved_registers))
+extern "C" uint64_t GetCurrentTaskOSStackPointer() {
+  return task_manager->CurrentTask().OSStackPointer();
 }

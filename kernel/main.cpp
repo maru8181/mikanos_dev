@@ -36,6 +36,7 @@
 #include "task.hpp"
 #include "terminal.hpp"
 #include "fat.hpp"
+#include "syscall.hpp"
 
 int printk(const char* format, ...) {
   va_list ap;
@@ -133,9 +134,11 @@ extern "C" void KernelMainNewStack(
   InitializeSegmentation();
   InitializePaging();
   InitializeMemoryManager(memory_map);
+  InitializeTSS();
   InitializeInterrupt();
 
   fat::Initialize(volume_image);
+  InitializeFont();
   InitializePCI();
 
   InitializeLayer();
@@ -148,19 +151,22 @@ extern "C" void KernelMainNewStack(
 
   const int kTextboxCursorTimer = 1;
   const int kTimer05Sec = static_cast<int>(kTimerFreq * 0.5);
-  timer_manager->AddTimer(Timer{kTimer05Sec, kTextboxCursorTimer});
+  timer_manager->AddTimer(Timer{kTimer05Sec, kTextboxCursorTimer, 1});
   bool textbox_cursor_visible = false;
+
+  InitializeSyscall();
 
   InitializeTask();
   Task& main_task = task_manager->CurrentTask();
-  const uint64_t task_terminal_id = task_manager->NewTask()
-    .InitContext(TaskTerminal, 0)
-    .Wakeup()
-    .ID();
 
   usb::xhci::Initialize();
   InitializeKeyboard();
   InitializeMouse();
+
+  app_loads = new std::map<fat::DirectoryEntry*, AppLoadInfo>;
+  task_manager->NewTask()
+    .InitContext(TaskTerminal, 0)
+    .Wakeup();
 
   char str[128];
 
@@ -192,20 +198,23 @@ extern "C" void KernelMainNewStack(
       if (msg->arg.timer.value == kTextboxCursorTimer) {
         __asm__("cli");
         timer_manager->AddTimer(
-            Timer{msg->arg.timer.timeout + kTimer05Sec, kTextboxCursorTimer});
+            Timer{msg->arg.timer.timeout + kTimer05Sec, kTextboxCursorTimer, 1});
         __asm__("sti");
         textbox_cursor_visible = !textbox_cursor_visible;
         DrawTextCursor(textbox_cursor_visible);
         layer_manager->Draw(text_window_layer_id);
-
-        __asm__("cli");
-        task_manager->SendMessage(task_terminal_id, *msg);
-        __asm__("sti");
       }
       break;
     case Message::kKeyPush:
       if (auto act = active_layer->GetActive(); act == text_window_layer_id) {
-        InputTextWindow(msg->arg.keyboard.ascii);
+        if (msg->arg.keyboard.press) {
+          InputTextWindow(msg->arg.keyboard.ascii);
+        }
+      } else if (msg->arg.keyboard.press &&
+                 msg->arg.keyboard.keycode == 59 /* F2 */) {
+        task_manager->NewTask()
+          .InitContext(TaskTerminal, 0)
+          .Wakeup();
       } else {
         __asm__("cli");
         auto task_it = layer_task_map->find(act);
